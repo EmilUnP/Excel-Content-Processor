@@ -4,6 +4,62 @@ All notable changes to Excel Content Processor are documented here.
 
 ---
 
+## [3.4.3] — 2026-09-21
+
+### Partial translation + question body in a variant column
+
+Follow-up to 3.4.2 after more bad rows:
+
+1. **Half-translated cells** — output mixed Azerbaijani with leftover Russian.
+   Detection only treated `source === output` as failure, so mixed cells were
+   saved as success. Now leftover Cyrillic triggers a solo retry.
+2. **Question stem swapped into a variant** — question column shrunk to a short
+   fragment while a variant column held the long stem (e.g. Roosevelt / New Deal
+   rows). Structural length checks now flag and re-translate those cells.
+3. Prompts require translating the **entire** cell and forbid swapping content
+   between question and variant cells.
+
+Audit: `npm run check:merged` also reports partial Cyrillic and swap patterns.
+
+### Simple Russian-alphabet finish check
+
+After every translation finishes, the app scans question/variant cells for any
+Cyrillic letters. None → clean. Any found → listed as a problem (UI + server log).
+
+Manual re-check anytime:
+
+```bash
+npm run check:russian
+npm run check:russian -- data/files/your_translated_az.json
+```
+
+---
+
+## [3.4.2] — 2026-09-21
+
+### Question / variant cells mixed after batch translation
+
+On a Russian→Azerbaijani run of 1000+ questions, a handful of rows came back
+with answer options inside the **question** column — e.g. the question ending
+in `1.` while Variant 1 lost its number, or the full `1. … 2. … 3. …` list
+pasted into the question cell. Code / answer-key columns stayed correct.
+
+**Cause:** Batches were sent as a numbered list (`1. "…"`, `2. "…"`). Question
+and variant cells from the same row sit next to each other in that list, so the
+model sometimes treated batch indices as multiple-choice markers and remapped
+text across cells. The run still “succeeded” because only array length was
+checked.
+
+**Fix:**
+1. Batch items use opaque tags `[T01]`, `[T02]`, … instead of `1.` / `2.`.
+2. Prompts state each block is one independent spreadsheet cell — never merge
+   or invent option lists.
+3. After each batch, structural checks detect gained option markers / emptied
+   variants and re-translate those cells alone.
+4. Audit: `npm run check:merged` (optional path to a translated JSON file).
+
+---
+
 ## [3.4.1] — 2026-09-18
 
 Two defects from a real run: 1,636 questions, Russian to Azerbaijani, on a

@@ -55,11 +55,12 @@ export function ProgressBar({
 
   return (
     <div className={cn(
-      "fixed top-0 left-0 right-0 z-50",
+      // Above TranslationPanel (z-50) so progress stays readable after "Hide"
+      "fixed top-0 left-0 right-0 z-[60] pointer-events-none",
       className
     )}>
       {/* Floating Card Container */}
-      <div className="max-w-2xl mx-auto px-4 pt-6">
+      <div className="max-w-2xl mx-auto px-4 pt-6 pointer-events-auto">
         <div className="bg-white rounded-2xl shadow-2xl border border-gray-100 overflow-hidden animate-in slide-in-from-top duration-500">
           {/* Status Bar Indicator */}
           <div className="h-1.5 relative overflow-hidden">
@@ -74,13 +75,13 @@ export function ProgressBar({
           </div>
 
           {/* Card Content */}
-          <div className="p-6">
+          <div className="p-5 sm:p-6">
             {/* Header Row */}
             <div className="flex items-start justify-between mb-4">
-              <div className="flex items-start gap-4 flex-1">
+              <div className="flex items-start gap-4 flex-1 min-w-0">
                 {/* Animated Icon Container */}
                 <div className={cn(
-                  "p-3 rounded-xl bg-gradient-to-br transition-all duration-300",
+                  "p-3 rounded-xl bg-gradient-to-br transition-all duration-300 shrink-0",
                   status === 'success' ? 'bg-emerald-50' : 
                   status === 'error' ? 'bg-red-50' : 
                   'bg-blue-50'
@@ -99,12 +100,12 @@ export function ProgressBar({
                 {/* Message Section */}
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <h3 className="text-base font-bold text-gray-900">
-                      {message || 'Processing...'}
+                    <h3 className="text-base font-bold text-gray-900 break-words">
+                      {message || 'Processing…'}
                     </h3>
                     {estimatedTime && (
                       <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
-                        ⏱ {estimatedTime}
+                        {estimatedTime}
                       </span>
                     )}
                   </div>
@@ -113,13 +114,16 @@ export function ProgressBar({
                   <div className="flex items-center gap-3 mt-2">
                     <div className="flex items-center gap-1.5 text-sm text-gray-600">
                       <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-                      <span className="font-semibold">
-                        {current}
+                      <span className="font-semibold tabular-nums">
+                        {current.toLocaleString()}
                       </span>
                       <span className="text-gray-400">of</span>
-                      <span className="font-bold text-gray-700">
-                        {total}
+                      <span className="font-bold text-gray-700 tabular-nums">
+                        {total.toLocaleString()}
                       </span>
+                      {status === 'loading' && total > 0 && (
+                        <span className="text-gray-400">cells</span>
+                      )}
                     </div>
                   </div>
                 </div>

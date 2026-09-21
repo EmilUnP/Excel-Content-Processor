@@ -1,4 +1,4 @@
-# Excel Content Processor v3.4 - Simple File-Based Version
+# Excel Content Processor v3.4.3 - Simple File-Based Version
 
 A modern, AI-powered Excel content processor that transforms complex HTML-encoded data into clean, readable content. This version uses simple file-based storage instead of a database for easy setup and deployment.
 
@@ -476,4 +476,4 @@ For issues and questions:
 
 ---
 
-**Excel Content Processor v3.4** - Making data processing simple, powerful and fast! 🚀
+**Excel Content Processor v3.4.3** - Making data processing simple, powerful and fast! 🚀

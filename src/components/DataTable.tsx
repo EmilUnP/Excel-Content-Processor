@@ -2174,10 +2174,6 @@ export function DataTable({
                 <Stat label="images in total" value={imageReport.stats.totalImages} tone="violet" />
               </>
             )}
-            <span className="text-gray-400">
-              {(tableData[0]?.length || 0).toLocaleString()} columns &middot;{' '}
-              {(data?.length || 0).toLocaleString()} cells
-            </span>
           </span>
 
           {isFillingRows && (

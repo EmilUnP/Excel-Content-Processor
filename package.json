@@ -1,6 +1,6 @@
 {
   "name": "excel-content-processor-v3",
-  "version": "3.4.1",
+  "version": "3.4.3",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "next lint",
     "type-check": "tsc --noEmit",
-    "check:text": "tsx scripts/check-text-cleaning.ts"
+    "check:text": "tsx scripts/check-text-cleaning.ts",
+    "check:merged": "tsx scripts/check-merged-variants.ts",
+    "check:russian": "tsx scripts/check-russian.ts"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.0.0",

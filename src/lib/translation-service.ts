@@ -7,6 +7,11 @@ import {
   getOpenRouterHeaders,
   toOpenRouterModelId
 } from './ai-provider';
+import {
+  findCrossCellMergeIndices,
+  looksContentMerged,
+  looksPartiallyUntranslated
+} from './translation-structure';
 
 /** Every request goes to OpenRouter; only the model id differs. */
 function isGeminiModel(model: string): boolean {
@@ -47,6 +52,11 @@ interface RunStats {
   recovered: number;
   /** How many are still identical to their source now the run is over. */
   untouched: number;
+  /**
+   * Texts re-sent because the model merged answer options into another cell
+   * (or emptied a variant while stuffing its text into the question).
+   */
+  mergedRetries: number;
 }
 
 /**
@@ -98,6 +108,14 @@ function looksUntranslated(source: string, output: string, targetLanguage: strin
   return (before.match(/[а-яё]/gi) || []).length >= 3;
 }
 
+/** Fully untouched, or only half-translated (Cyrillic still in the output). */
+function needsRetranslation(source: string, output: string, targetLanguage: string): boolean {
+  return (
+    looksUntranslated(source, output, targetLanguage) ||
+    looksPartiallyUntranslated(source, output, targetLanguage)
+  );
+}
+
 export async function translateDataWithStructure(
   fileData: FileData,
   targetLanguage: string,
@@ -117,7 +135,13 @@ export async function translateDataWithStructure(
   // "gemini-2.5-flash" is "google/gemini-2.5-flash" there.
   const requestModel = toOpenRouterModelId(model);
 
-  const stats: RunStats = { shortBatches: 0, retried: 0, recovered: 0, untouched: 0 };
+  const stats: RunStats = {
+    shortBatches: 0,
+    retried: 0,
+    recovered: 0,
+    untouched: 0,
+    mergedRetries: 0
+  };
 
   // One client for the whole job instead of one per batch.
   const openai = new OpenAI({
@@ -166,7 +190,7 @@ export async function translateDataWithStructure(
     if (result) translatedCells.push(...result);
   }
 
-  if (stats.retried > 0 || stats.shortBatches > 0) {
+  if (stats.retried > 0 || stats.shortBatches > 0 || stats.mergedRetries > 0) {
     console.log('Translation recovery:', JSON.stringify(stats));
   }
   if (stats.untouched > 0) {
@@ -318,19 +342,22 @@ async function translateBatch(
       }
     }
 
-    // Anything the model handed straight back is re-sent on its own. A text
-    // alone in its own request is a far easier job than one line out of thirty,
-    // and this is what stops a run from finishing with a few questions still in
-    // the source language and nothing saying so.
+    // Anything the model handed straight back — or only half-translated — is
+    // re-sent on its own. A text alone in its own request is a far easier job
+    // than one line out of thirty, and this is what stops a run from finishing
+    // with a few questions still partly in Russian.
     for (let i = 0; i < allTranslations.length; i++) {
       if (alreadyAlone.has(i)) continue;
-      if (!looksUntranslated(textsToTranslate[i], allTranslations[i], targetLanguage)) continue;
+      if (!needsRetranslation(textsToTranslate[i], allTranslations[i], targetLanguage)) continue;
       stats.retried++;
       try {
         const retry = await translateText(textsToTranslate[i], targetLanguage, openai, model);
-        if (!looksUntranslated(textsToTranslate[i], retry, targetLanguage)) {
+        if (!needsRetranslation(textsToTranslate[i], retry, targetLanguage)) {
           allTranslations[i] = retry;
           stats.recovered++;
+        } else if (!looksUntranslated(textsToTranslate[i], retry, targetLanguage)) {
+          // Partial may have improved; keep the retry even if a little Cyrillic remains
+          allTranslations[i] = retry;
         }
       } catch (error) {
         // One refusal means the next will be refused too - an expired key, a
@@ -341,9 +368,41 @@ async function translateBatch(
       }
     }
 
+    // Catch remapping: options merged into the question, question body swapped
+    // into a variant column, or Cyrillic left in an "already translated" cell.
+    const mergedIndices = findCrossCellMergeIndices(
+      cellsToTranslate,
+      textsToTranslate,
+      allTranslations,
+      targetLanguage
+    );
+    for (const i of mergedIndices) {
+      if (alreadyAlone.has(i)) continue;
+      stats.mergedRetries++;
+      stats.retried++;
+      alreadyAlone.add(i);
+      try {
+        const retry = await translateText(textsToTranslate[i], targetLanguage, openai, model);
+        const stillBad =
+          looksContentMerged(textsToTranslate[i], retry) ||
+          looksPartiallyUntranslated(textsToTranslate[i], retry, targetLanguage);
+        if (!stillBad) {
+          allTranslations[i] = retry;
+          stats.recovered++;
+        } else {
+          console.warn(
+            `Structure/partial retry still suspicious (row ${cellsToTranslate[i].rowIndex}, col ${cellsToTranslate[i].colIndex}); keeping retry output`
+          );
+          allTranslations[i] = retry;
+        }
+      } catch (error) {
+        console.error('Re-sending a remapped/partial cell failed:', error);
+      }
+    }
+
     // Counted once, here, so a text that was re-sent twice is still one number.
     for (let i = 0; i < allTranslations.length; i++) {
-      if (looksUntranslated(textsToTranslate[i], allTranslations[i], targetLanguage)) {
+      if (needsRetranslation(textsToTranslate[i], allTranslations[i], targetLanguage)) {
         stats.untouched++;
       }
     }
@@ -431,39 +490,36 @@ async function translateBatchTexts(
   console.log('Sending batch of', texts.length, 'texts for translation');
   
   try {
-    // The entity decoder that used to live here is now decodeHtmlEntities, run
-    // in prepareTextForTranslation so that a text sent on its own gets it too.
+    // Opaque IDs (T01, T02, …) — NOT "1." / "2." — so the model cannot confuse
+    // batch position with multiple-choice markers that already live inside the
+    // cell text. That confusion is what produced ~5 rows where options were
+    // pasted into the question field on a 1000+ question Russian→AZ run.
+    const textsBlock = texts.map((text, index) => {
+      const id = `T${String(index + 1).padStart(2, '0')}`;
+      return `[${id}]\n${text}`;
+    }).join('\n\n');
     
-    // Build a safer prompt that avoids JSON escaping issues
-    const textsJSON = texts.map((text, index) => {
-      // Escape special characters properly
-      const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
-      return `${index + 1}. "${escaped}"`;
-    }).join('\n');
-    
-    const prompt = `You are a professional translator. Translate the following texts to ${targetLanguage}.
+    const prompt = `You are a professional translator. Translate each spreadsheet CELL below to ${targetLanguage}.
 
-RULES:
-- Translate each text accurately preserving all formatting and HTML tags
-- CRITICAL: Preserve paragraph structure - questions and options should be properly separated
-- CRITICAL: Always add a space after question marks (?) before numbered/lettered options (I., II., 1., 2., etc.)
-- CRITICAL: Ensure proper spacing between multiple choice options (I., II., III., IV. or 1., 2., 3., 4.)
-- CRITICAL: If options appear on the same line, separate them with spaces: "I. Option II. Option" NOT "I. OptionII. Option"
-- Return ONLY a valid JSON object with this exact structure: {"translations": ["translation1", "translation2", ...]}
-- Keep the exact same order as the input
-- Escape all special characters in JSON strings properly
-- Do NOT add explanations, comments, or extra content
-- Return ONLY the JSON object
+CELL RULES (critical):
+- Each [Txx] block is ONE independent spreadsheet cell. Translate ONLY that cell's text.
+- NEVER merge, combine, move, swap, or copy text between cells.
+- NEVER put a question stem into a variant cell, or variant text into the question cell.
+- NEVER attach answer options from another cell onto a question cell.
+- NEVER invent numbered/lettered options that are not already inside that same cell.
+- Translate the ENTIRE cell into ${targetLanguage}. Do not leave any source-language words or sentences mixed in.
+- If a cell is only a question prompt, return only the translated prompt — do not add "1. 2. 3." lists.
+- If a cell is only one option (e.g. starts with "1." or "a)"), translate that option alone; keep its marker if present.
+- Preserve formatting, line breaks, and HTML tags inside each cell.
+- If a single cell already contains both a question and its options, keep them separated (newline or space after the stem before "1." / "a)" / "I.").
 
-PARAGRAPHING EXAMPLES:
-❌ WRONG: "Question?I. Option II. Option"
-✅ CORRECT: "Question? I. Option II. Option"
+OUTPUT:
+- Return ONLY valid JSON: {"translations": ["…", "…", …]}
+- Exactly ${texts.length} strings, in the same order as [T01], [T02], …
+- No explanations, no markdown, no extra keys.
 
-❌ WRONG: "Question?1. Option2. Option"
-✅ CORRECT: "Question? 1. Option 2. Option"
-
-Texts to translate:
-${textsJSON}
+Cells:
+${textsBlock}
 
 Return only the JSON object:`;
 
@@ -472,7 +528,8 @@ Return only the JSON object:`;
       messages: [
         {
           role: 'system',
-          content: 'You are a professional translator. You translate text accurately while preserving formatting and structure. You ALWAYS return valid, properly escaped JSON without any additional text.'
+          content:
+            'You are a professional translator for spreadsheet cells. Each input block is an independent cell. Never merge cells. Always return valid JSON with a translations array of the same length as the input.'
         },
         {
           role: 'user',
@@ -577,20 +634,14 @@ async function translateText(
 ): Promise<string> {
   if (!text.trim()) return text;
   
-  const prompt = `Translate this text to ${targetLanguage}. 
+  const prompt = `Translate this single spreadsheet cell to ${targetLanguage}.
 
-CRITICAL RULES:
-1. Preserve all formatting, structure, and HTML tags
-2. CRITICAL: Always add a space after question marks (?) before numbered/lettered options (I., II., 1., 2., etc.)
-3. CRITICAL: Ensure proper spacing between multiple choice options
-4. Return ONLY the translated text, nothing else
-
-PARAGRAPHING EXAMPLES:
-❌ WRONG: "Question?I. Option II. Option"
-✅ CORRECT: "Question? I. Option II. Option"
-
-❌ WRONG: "Question?1. Option2. Option"
-✅ CORRECT: "Question? 1. Option 2. Option"
+RULES:
+1. Translate ONLY the text of this one cell. Do not add, remove, move, or invent options/lists.
+2. Translate the ENTIRE cell into ${targetLanguage}. Leave no source-language words mixed in.
+3. Preserve formatting, line breaks, structure, and HTML tags.
+4. If this cell already contains both a question and options, keep them separated (newline or space before "1." / "a)" / "I.").
+5. Return ONLY the translated cell text, nothing else.
 
 Text: ${text}
 
@@ -601,7 +652,8 @@ Translation:`;
     messages: [
       {
         role: 'system',
-        content: 'You are a professional translator. Translate accurately while preserving all formatting.'
+        content:
+          'You are a professional translator for one spreadsheet cell. Translate the entire cell accurately into the target language. Never leave source-language fragments. Never invent or attach multiple-choice options that are not in the input.'
       },
       {
         role: 'user',

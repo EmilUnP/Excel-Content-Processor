@@ -161,7 +161,7 @@ export default function HomePage() {
                 </div>
                 <div>
                   <h1 className="text-2xl font-bold bg-gradient-to-r from-slate-900 via-slate-800 to-slate-700 bg-clip-text text-transparent">
-                    Excel Content Processor v3.4
+                    Excel Content Processor v3.4.3
                   </h1>
                   <p className="text-sm text-slate-600 mt-0.5 font-medium">
                     AI-powered data processing and translation
@@ -193,10 +193,11 @@ export default function HomePage() {
                   <Button
                     onClick={() => setShowModelSelection(true)}
                     variant="outline"
-                    className="border-slate-300 hover:bg-slate-50 hover:border-slate-400 transition-all"
+                    className="border-slate-300 hover:bg-slate-50 hover:border-slate-400 transition-all max-w-[240px]"
+                    title={settings.selectedModel}
                   >
-                    <Cpu className="h-4 w-4 mr-2" />
-                    AI Model
+                    <Cpu className="h-4 w-4 mr-2 flex-shrink-0" />
+                    <span className="truncate">{settings.selectedModel}</span>
                   </Button>
                 </div>
               )}
@@ -245,7 +246,7 @@ export default function HomePage() {
                     <FileText className="h-10 w-10 text-white" />
                   </div>
                   <h2 className="text-4xl font-bold text-gray-900 mb-4">
-                    Excel Content Processor v3.4
+                    Excel Content Processor v3.4.3
                   </h2>
                   <p className="text-xl text-gray-600 mb-8 max-w-3xl mx-auto leading-relaxed">
                     Transform your complex HTML-encoded Excel data into clean, readable content. 
@@ -289,24 +290,21 @@ export default function HomePage() {
                     <p className="text-slate-600 mt-1 font-medium">
                       {currentFile.totalRows.toLocaleString()} rows • {currentFile.totalColumns.toLocaleString()} columns • {(currentFile.cells?.length || 0).toLocaleString()} cells
                     </p>
-                    <div className="flex items-center gap-4 mt-2 text-sm text-slate-500">
-                      {currentFile.cells?.some(cell => cell.hasHtml) && (
-                        <span className="flex items-center gap-1.5">
-                          <div className="w-2 h-2 bg-orange-500 rounded-full"></div>
-                          HTML Content
-                        </span>
-                      )}
-                      {currentFile.cells?.some(cell => cell.hasImages) && (
-                        <span className="flex items-center gap-1.5">
-                          <div className="w-2 h-2 bg-blue-500 rounded-full"></div>
-                          Images
-                        </span>
-                      )}
-                    </div>
                   </div>
                   <div className="flex items-center space-x-2">
-                    <div className="w-3 h-3 bg-gradient-to-r from-green-400 to-emerald-400 rounded-full animate-pulse"></div>
-                    <span className="text-green-600 text-sm font-semibold">Ready</span>
+                    {isProcessing ? (
+                      <>
+                        <div className="w-3 h-3 bg-blue-500 rounded-full animate-pulse" />
+                        <span className="text-blue-600 text-sm font-semibold">
+                          Working… {processingProgress.percentage}%
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <div className="w-3 h-3 bg-gradient-to-r from-green-400 to-emerald-400 rounded-full animate-pulse" />
+                        <span className="text-green-600 text-sm font-semibold">Ready</span>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
