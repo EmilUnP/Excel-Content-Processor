@@ -32,7 +32,8 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronsLeft,
-  ChevronsRight
+  ChevronsRight,
+  FileSpreadsheet
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import * as XLSX from 'xlsx';
@@ -1145,6 +1146,8 @@ interface DataTableProps {
   data: CellData[];
   /** Stored file id - needed by the image-question filter action. */
   fileId?: string;
+  /** Display name shown in the file list — used for export download names. */
+  fileName?: string;
   /** Called with the new file after an action rewrites the open one. */
   onFileReplaced?: (file: FileData) => void;
   /** Model used for the AI image analysis, from the AI Model panel. */
@@ -1158,6 +1161,7 @@ interface DataTableProps {
 export function DataTable({ 
   data, 
   fileId,
+  fileName,
   onFileReplaced,
   selectedModel = 'gpt-5-nano',
   onCellEdit, 
@@ -1349,73 +1353,115 @@ export function DataTable({
   }, [onCellDelete]);
 
 
+  /**
+   * Long digit-only values (question IDs) must stay text. Excel / SheetJS otherwise
+   * turn them into numbers → scientific notation (2.50411E+17) and lose digits.
+   */
+  const looksLikeNumericId = (value: string): boolean => /^\d{12,}$/.test(value.trim());
+
+  /**
+   * Download name from the file's nice title in the app
+   * (e.g. "Olimpiada_new_phase_HIS.xlsx (az)" → "Olimpiada_new_phase_HIS.xlsx (az).csv").
+   */
+  const buildExportFileName = (extension: string): string => {
+    const date = new Date().toISOString().split('T')[0];
+    const fallback = `data-export-${date}`;
+    const raw = (fileName || '').trim() || fallback;
+
+    // Strip a trailing extension so we do not get ".xlsx.csv"
+    const withoutExt = raw.replace(/\.(xlsx|xls|csv|html|htm)$/i, '');
+    const safe = withoutExt
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 180);
+
+    return `${safe || fallback}.${extension}`;
+  };
+
   const handleExportExcelWithHTML = () => {
     if (!tableData || tableData.length === 0) return;
 
-    // Helper function to check if a column should be formatted
+    // Excel cells cannot hold more than 32,767 characters. Real cells with
+    // embedded base64 images blow past that and XLSX.writeFile throws.
+    const EXCEL_MAX_CELL = 32767;
+    const truncateNote = '\n…[truncated for Excel 32767-char limit]';
+
     const shouldFormatColumn = (colIndex: number, cellValue: string): boolean => {
-      // Don't format ID columns (0, 1)
       if (colIndex === 0 || colIndex === 1) return false;
-      
-      // Don't format code columns (values are just 0 or 1)
       if (cellValue === '0' || cellValue === '1') return false;
-      
-      // Don't format null/empty values
       if (!cellValue || !cellValue.trim()) return false;
-      
-      // Don't format literal "null" or "NULL" strings
       if (cellValue.trim().toLowerCase() === 'null') return false;
-      
       return true;
     };
 
-    // Convert table data to Excel format with translated text and HTML structure
+    /** Keep a short <img> marker; drop base64 payloads that inflate the cell. */
+    const shrinkImagesForExcel = (html: string): string => {
+      return html.replace(/<img[^>]*>/gi, (tag) => {
+        if (tag.length <= 200) return tag;
+        const alt = tag.match(/\balt=["']([^"']*)["']/i)?.[1] || '';
+        return alt ? `[IMAGE: ${alt}]` : '[IMAGE]';
+      });
+    };
+
+    const fitExcelCell = (text: string): { value: string; truncated: boolean } => {
+      if (text.length <= EXCEL_MAX_CELL) return { value: text, truncated: false };
+      const budget = EXCEL_MAX_CELL - truncateNote.length;
+      return { value: text.slice(0, Math.max(0, budget)) + truncateNote, truncated: true };
+    };
+
     const workbook = XLSX.utils.book_new();
-    const worksheetData = tableData.map(row => 
+    let truncatedCells = 0;
+
+    const worksheetData = tableData.map((row) =>
       row.map((cell, colIndex) => {
         if (!cell) return '';
-        
-        // Use cleaned (translated) text as base
+
         let content = cell.cleaned || '';
-        
-        // Apply paragraph formatting to translated text
         content = formatAsParagraphs(content, colIndex, shouldFormatColumn);
-        
-        // If cell has images, add them from original
+
+        // Prefer a short image marker over pasting megabytes of base64.
         if (cell.hasImages && cell.original) {
           const imageMatches = cell.original.match(/<img[^>]*>/g);
           if (imageMatches) {
-            content = content + '\n' + imageMatches.join('\n');
+            content =
+              content +
+              '\n' +
+              imageMatches.map((tag) => shrinkImagesForExcel(tag)).join('\n');
           }
         }
-        
-        // Extract and preserve span styles from original if they exist
+
         if (cell.original && cell.original.includes('<span')) {
-          const spanMatches = cell.original.match(/<span[^>]*>/g);
-          if (spanMatches) {
-            // Try to apply basic styling
-            content = content.replace(/<p>/g, '<p style="font-family: Cambria, serif;">');
-          }
+          content = content.replace(/<p>/g, '<p style="font-family: Cambria, serif;">');
         }
-        
-        return content;
+
+        const fitted = fitExcelCell(content);
+        if (fitted.truncated) truncatedCells++;
+        return fitted.value;
       })
     );
 
     const worksheet = XLSX.utils.aoa_to_sheet(worksheetData);
-    
-    // Enable HTML formatting for all cells
     const range = XLSX.utils.decode_range(worksheet['!ref'] || 'A1');
-    
+
     for (let row = range.s.r; row <= range.e.r; row++) {
       for (let col = range.s.c; col <= range.e.c; col++) {
         const cellAddress = XLSX.utils.encode_cell({ r: row, c: col });
         const cell = worksheet[cellAddress];
         if (!cell) continue;
-        
+
+        // Restore text from our source array — aoa_to_sheet may have already
+        // converted long digit IDs into lossy numbers.
+        const raw = String(worksheetData[row]?.[col] ?? '');
+        const forceText = col === 0 || looksLikeNumericId(raw);
+
         cell.t = 's';
+        cell.v = forceText ? raw.trim() : raw;
+        if (forceText) {
+          cell.z = '@'; // Excel "Text" format
+        }
         cell.s = {
-          alignment: { 
+          alignment: {
             wrapText: true,
             vertical: 'top',
             horizontal: 'left'
@@ -1425,7 +1471,6 @@ export function DataTable({
       }
     }
 
-    // Set column widths
     const maxWidths = new Array(range.e.c + 1).fill(0);
     for (let row = range.s.r; row <= range.e.r; row++) {
       for (let col = range.s.c; col <= range.e.c; col++) {
@@ -1437,11 +1482,99 @@ export function DataTable({
         }
       }
     }
-    worksheet['!cols'] = maxWidths.map(w => ({ wch: Math.min(Math.max(w, 15), 100) }));
+    worksheet['!cols'] = maxWidths.map((w) => ({ wch: Math.min(Math.max(w, 15), 100) }));
 
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Data');
+    XLSX.writeFile(workbook, buildExportFileName('xlsx'));
 
-    XLSX.writeFile(workbook, `data-export-translated-html-${new Date().toISOString().split('T')[0]}.xlsx`);
+    if (truncatedCells > 0) {
+      alert(
+        `Excel export finished, but ${truncatedCells} cell(s) were longer than Excel's 32,767-character limit and were truncated.\n\n` +
+          `Use "Export CSV" for the full text (no length limit).`
+      );
+    }
+  };
+
+  /**
+   * CSV export — no 32,767-char Excel cell limit. Keeps translated text AND
+   * original images (base64). Files can be large; that is intentional so images
+   * are not discarded the way Excel export must shrink them.
+   */
+  const handleExportCSV = () => {
+    if (!tableData || tableData.length === 0) return;
+
+    const escapeCsv = (value: string): string => {
+      const normalized = value.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      if (/[",\n]/.test(normalized)) {
+        return `"${normalized.replace(/"/g, '""')}"`;
+      }
+      return normalized;
+    };
+
+    /**
+     * Translated text + full images from original (base64 kept).
+     * Placeholders left in cleaned are removed; real <img> tags are appended
+     * so nothing is discarded.
+     */
+    const cellForCsv = (cell: CellData | null | undefined): string => {
+      if (!cell) return '';
+
+      let text = cell.cleaned || '';
+      const imageTags =
+        cell.hasImages && cell.original
+          ? cell.original.match(/<img[^>]*>/gi) || []
+          : [];
+
+      if (imageTags.length === 0) return text;
+
+      // Drop placeholders / any leftover img markup from cleaned — real tags follow
+      text = text
+        .replace(/\[IMAGE_DATA\]/gi, '')
+        .replace(/\[IMAGE\]/gi, '')
+        .replace(/<img[^>]*>/gi, '')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+
+      return text ? `${text}\n${imageTags.join('\n')}` : imageTags.join('\n');
+    };
+
+    /**
+     * When Excel opens a CSV it re-parses digit-only cells as numbers.
+     * `="250411…"` forces Excel to keep the full ID as text.
+     */
+    const csvSafeValue = (col: number, text: string): string => {
+      const trimmed = text.trim();
+      if (col === 0 || looksLikeNumericId(trimmed)) {
+        return escapeCsv(`="${trimmed}"`);
+      }
+      return escapeCsv(text);
+    };
+
+    const colCount = Math.max(...tableData.map((row) => row.length), 0);
+    const header = Array.from({ length: colCount }, (_, i) => `Col_${i + 1}`);
+
+    const lines: string[] = [header.map(escapeCsv).join(',')];
+
+    for (const row of tableData) {
+      const values: string[] = [];
+      for (let col = 0; col < colCount; col++) {
+        values.push(csvSafeValue(col, cellForCsv(row[col])));
+      }
+      lines.push(values.join(','));
+    }
+
+    // BOM so Excel opens UTF-8 (Azerbaijani / Cyrillic) correctly
+    const csv = '\uFEFF' + lines.join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = buildExportFileName('csv');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   const handleExportHTML = () => {
@@ -1654,7 +1787,7 @@ export function DataTable({
     const link = document.createElement('a');
     const url = URL.createObjectURL(blob);
     link.setAttribute('href', url);
-    link.setAttribute('download', `data-export-${new Date().toISOString().split('T')[0]}.html`);
+    link.setAttribute('download', buildExportFileName('html'));
     link.style.visibility = 'hidden';
     document.body.appendChild(link);
     link.click();
@@ -2116,8 +2249,18 @@ export function DataTable({
             <Button
               variant="outline"
               size="sm"
+              onClick={handleExportCSV}
+              title="Export full text + images as CSV (may be large; no Excel 32,767 limit)"
+              className="bg-sky-50 border-sky-300 text-sky-700 hover:bg-sky-100"
+            >
+              <FileSpreadsheet className="h-4 w-4 mr-1" />
+              Export CSV
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
               onClick={handleExportExcelWithHTML}
-              title="Export with HTML and images to Excel (.xlsx)"
+              title="Export with HTML to Excel (.xlsx). Cells over 32,767 chars are truncated."
               className="bg-purple-50 border-purple-300 text-purple-700 hover:bg-purple-100"
             >
               <FileText className="h-4 w-4 mr-1" />

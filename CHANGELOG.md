@@ -4,6 +4,25 @@ All notable changes to Excel Content Processor are documented here.
 
 ---
 
+## [3.4.4] — 2026-09-22
+
+### Excel export crash on long cells + CSV download
+
+`Excel + HTML` failed with `Text length must not exceed 32767 characters` when a
+cell (often with base64 images) exceeded Excel's hard limit.
+
+- Excel export now shrinks image tags and truncates oversize cells instead of
+  crashing; warns how many cells were truncated.
+- New **Export CSV** button — full text, no 32,767 limit (UTF-8 BOM for Excel).
+- Long question IDs stay as **text** (not `2.50E+17` scientific notation) in both
+  Excel and CSV exports.
+- **Export CSV** keeps images (full `<img>` / base64 from original) instead of
+  stripping them to `[IMAGE]`. File may be large; Excel export still shrinks images.
+- Export downloads use the file’s **nice name** from the app
+  (e.g. `Olimpiada_new_phase_HIS.xlsx (az).csv`) instead of `data-export-…`.
+
+---
+
 ## [3.4.3] — 2026-09-21
 
 ### Partial translation + question body in a variant column

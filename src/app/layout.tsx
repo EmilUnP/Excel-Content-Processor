@@ -5,20 +5,20 @@ import './globals.css';
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'Excel Content Processor v3.4.3',
+  title: 'Excel Content Processor v3.4.4',
   description: 'AI-powered Excel and CSV content processing with translation and cleaning',
   keywords: ['Excel', 'CSV', 'AI', 'Translation', 'Data Processing'],
   authors: [{ name: 'Excel Content Processor Team' }],
   robots: 'index, follow',
   openGraph: {
-    title: 'Excel Content Processor v3.4.3',
+    title: 'Excel Content Processor v3.4.4',
     description: 'AI-powered Excel and CSV content processing with translation and cleaning',
     type: 'website',
     locale: 'en_US',
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'Excel Content Processor v3.4.3',
+    title: 'Excel Content Processor v3.4.4',
     description: 'AI-powered Excel and CSV content processing with translation and cleaning',
   },
 };

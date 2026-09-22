@@ -23,7 +23,8 @@
         "name": "next"
       }
     ],
-    "baseUrl": ".",
+    // Path aliases are resolved relative to this tsconfig (no baseUrl —
+    // that option is deprecated in TS 6 and removed in TS 7).
     "paths": {
       "@/*": ["./src/*"],
       "@/components/*": ["./src/components/*"],

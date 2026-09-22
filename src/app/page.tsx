@@ -161,7 +161,7 @@ export default function HomePage() {
                 </div>
                 <div>
                   <h1 className="text-2xl font-bold bg-gradient-to-r from-slate-900 via-slate-800 to-slate-700 bg-clip-text text-transparent">
-                    Excel Content Processor v3.4.3
+                    Excel Content Processor v3.4.4
                   </h1>
                   <p className="text-sm text-slate-600 mt-0.5 font-medium">
                     AI-powered data processing and translation
@@ -246,7 +246,7 @@ export default function HomePage() {
                     <FileText className="h-10 w-10 text-white" />
                   </div>
                   <h2 className="text-4xl font-bold text-gray-900 mb-4">
-                    Excel Content Processor v3.4.3
+                    Excel Content Processor v3.4.4
                   </h2>
                   <p className="text-xl text-gray-600 mb-8 max-w-3xl mx-auto leading-relaxed">
                     Transform your complex HTML-encoded Excel data into clean, readable content. 
@@ -314,6 +314,7 @@ export default function HomePage() {
                 <DataTable
                   data={currentFile.cells}
                   fileId={currentFile.id}
+                  fileName={currentFile.name}
                   selectedModel={settings.selectedModel}
                   editable={true}
                   showMetadata={true}
