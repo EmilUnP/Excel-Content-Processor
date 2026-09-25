@@ -45,6 +45,68 @@ import { analyzeImageQuestions, extractImageTags, isCodeColumn } from '@/lib/que
 // ============================================================================
 
 /**
+ * Real `<img>` tags for export — same source the UI / HTML export use.
+ * Never invents `[IMAGE]` placeholders.
+ */
+function collectExportImageTags(cell: CellData): string[] {
+  const fromOriginal = extractImageTags(cell.original);
+  if (fromOriginal.length > 0) return fromOriginal;
+
+  const loose = cell.original?.match(/<img[^>]*>/gi) || [];
+  if (loose.length > 0) return loose;
+
+  if (cell.imageData?.startsWith('data:image')) {
+    return [`<img src="${cell.imageData}" alt="question image" />`];
+  }
+  return [];
+}
+
+/**
+ * Builds one cell the way HTML export does: translated text + real image HTML.
+ * Strips leftover `[IMAGE]` / `[IMAGE_DATA]` placeholders from translation.
+ */
+function buildExportCellContent(
+  cell: CellData,
+  formatText?: (text: string) => string
+): { text: string; images: string[]; html: string } {
+  let text = cell.cleaned || '';
+  if (!text.trim() || text.trim().toLowerCase() === 'null') {
+    text = '';
+  }
+
+  text = text
+    .replace(/\[IMAGE_DATA\]/gi, '')
+    .replace(/\[IMAGE\]/gi, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  // If cleaned already holds full data-URL images, keep them; otherwise drop
+  // any stub <img> and attach the real ones from original.
+  const cleanedImgs = text.match(/<img[^>]*>/gi) || [];
+  const cleanedHasFullImages = cleanedImgs.some(
+    (tag) => /data:image\//i.test(tag) && tag.length > 200
+  );
+
+  if (!cleanedHasFullImages) {
+    text = text.replace(/<img[^>]*>/gi, '').trim();
+  }
+
+  if (formatText && text) {
+    text = formatText(text);
+  }
+
+  const images = cleanedHasFullImages ? cleanedImgs : collectExportImageTags(cell);
+  // When cleaned already had full images, they are inside `text` — don't duplicate
+  const imageSuffix = cleanedHasFullImages ? [] : images;
+  const html = imageSuffix.length > 0
+    ? (text ? `${text}${imageSuffix.join('')}` : imageSuffix.join(''))
+    : text;
+
+  return { text, images: imageSuffix, html };
+}
+
+/**
  * Cleans HTML entities from text
  */
 const cleanEntities = (str: string): string => {
@@ -1395,15 +1457,6 @@ export function DataTable({
       return true;
     };
 
-    /** Keep a short <img> marker; drop base64 payloads that inflate the cell. */
-    const shrinkImagesForExcel = (html: string): string => {
-      return html.replace(/<img[^>]*>/gi, (tag) => {
-        if (tag.length <= 200) return tag;
-        const alt = tag.match(/\balt=["']([^"']*)["']/i)?.[1] || '';
-        return alt ? `[IMAGE: ${alt}]` : '[IMAGE]';
-      });
-    };
-
     const fitExcelCell = (text: string): { value: string; truncated: boolean } => {
       if (text.length <= EXCEL_MAX_CELL) return { value: text, truncated: false };
       const budget = EXCEL_MAX_CELL - truncateNote.length;
@@ -1412,27 +1465,31 @@ export function DataTable({
 
     const workbook = XLSX.utils.book_new();
     let truncatedCells = 0;
+    let imagesOmitted = 0;
 
     const worksheetData = tableData.map((row) =>
       row.map((cell, colIndex) => {
         if (!cell) return '';
 
-        let content = cell.cleaned || '';
-        content = formatAsParagraphs(content, colIndex, shouldFormatColumn);
-
-        // Prefer a short image marker over pasting megabytes of base64.
-        if (cell.hasImages && cell.original) {
-          const imageMatches = cell.original.match(/<img[^>]*>/g);
-          if (imageMatches) {
-            content =
-              content +
-              '\n' +
-              imageMatches.map((tag) => shrinkImagesForExcel(tag)).join('\n');
+        const { text, images, html } = buildExportCellContent(cell, (raw) => {
+          let formatted = formatAsParagraphs(raw, colIndex, shouldFormatColumn);
+          if (cell.original && cell.original.includes('<span')) {
+            formatted = formatted.replace(
+              /<p>/g,
+              '<p style="font-family: Cambria, serif;">'
+            );
           }
-        }
+          return formatted;
+        });
 
-        if (cell.original && cell.original.includes('<span')) {
-          content = content.replace(/<p>/g, '<p style="font-family: Cambria, serif;">');
+        // Prefer full HTML like the HTML export (real <img> tags, not [IMAGE]).
+        // If that exceeds Excel's limit, keep the text and note that images
+        // need CSV/HTML export — never replace pictures with a fake [IMAGE] stub.
+        let content = html;
+        if (content.length > EXCEL_MAX_CELL && images.length > 0) {
+          imagesOmitted += images.length;
+          const note = `\n[${images.length} image(s) omitted — use Export CSV or Export to HTML for full images]`;
+          content = text ? `${text}${note}` : note.trim();
         }
 
         const fitted = fitExcelCell(content);
@@ -1487,18 +1544,25 @@ export function DataTable({
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Data');
     XLSX.writeFile(workbook, buildExportFileName('xlsx'));
 
+    const warnings: string[] = [];
     if (truncatedCells > 0) {
-      alert(
-        `Excel export finished, but ${truncatedCells} cell(s) were longer than Excel's 32,767-character limit and were truncated.\n\n` +
-          `Use "Export CSV" for the full text (no length limit).`
+      warnings.push(
+        `${truncatedCells} cell(s) were longer than Excel's 32,767-character limit and were truncated.`
       );
+    }
+    if (imagesOmitted > 0) {
+      warnings.push(
+        `${imagesOmitted} image(s) were omitted because they did not fit in an Excel cell.\nUse "Export CSV" or "Export to HTML" for full images (same as import).`
+      );
+    }
+    if (warnings.length > 0) {
+      alert(`Excel export finished with notes:\n\n${warnings.join('\n\n')}`);
     }
   };
 
   /**
-   * CSV export — no 32,767-char Excel cell limit. Keeps translated text AND
-   * original images (base64). Files can be large; that is intentional so images
-   * are not discarded the way Excel export must shrink them.
+   * CSV export — same cell content as HTML export: translated text + real
+   * `<img src="data:image/...">` tags (no `[IMAGE]` stubs). May be large.
    */
   const handleExportCSV = () => {
     if (!tableData || tableData.length === 0) return;
@@ -1509,34 +1573,6 @@ export function DataTable({
         return `"${normalized.replace(/"/g, '""')}"`;
       }
       return normalized;
-    };
-
-    /**
-     * Translated text + full images from original (base64 kept).
-     * Placeholders left in cleaned are removed; real <img> tags are appended
-     * so nothing is discarded.
-     */
-    const cellForCsv = (cell: CellData | null | undefined): string => {
-      if (!cell) return '';
-
-      let text = cell.cleaned || '';
-      const imageTags =
-        cell.hasImages && cell.original
-          ? cell.original.match(/<img[^>]*>/gi) || []
-          : [];
-
-      if (imageTags.length === 0) return text;
-
-      // Drop placeholders / any leftover img markup from cleaned — real tags follow
-      text = text
-        .replace(/\[IMAGE_DATA\]/gi, '')
-        .replace(/\[IMAGE\]/gi, '')
-        .replace(/<img[^>]*>/gi, '')
-        .replace(/[ \t]+\n/g, '\n')
-        .replace(/\n{3,}/g, '\n\n')
-        .trim();
-
-      return text ? `${text}\n${imageTags.join('\n')}` : imageTags.join('\n');
     };
 
     /**
@@ -1559,7 +1595,9 @@ export function DataTable({
     for (const row of tableData) {
       const values: string[] = [];
       for (let col = 0; col < colCount; col++) {
-        values.push(csvSafeValue(col, cellForCsv(row[col])));
+        const cell = row[col];
+        const content = cell ? buildExportCellContent(cell).html : '';
+        values.push(csvSafeValue(col, content));
       }
       lines.push(values.join(','));
     }
@@ -1701,75 +1739,37 @@ export function DataTable({
       
       for (let j = 0; j < row.length; j++) {
         const cell = row[j];
-        let cellContent = '';
         let cellClass = '';
-        
+
         if (cell) {
-          // For HTML export: use cleaned (translated) text, plus any images from original
-          // CRITICAL: Always use cleaned, never original for HTML export
-          let content = cell.cleaned || '';
-          
-          // Debug: Log what we're exporting (especially merged markers)
-          if (content.includes('varb.') || content.includes('varc.') || content.includes('vare.') ||
-              content.includes('bölünürb.') || content.includes('bölünürc.') || content.includes('bölünürd.') || content.includes('bölünüre.') ||
-              content.includes('bilərd.') || content.includes('bərabərdirb.') || content.includes('bərabərdirc.') || 
-              content.includes('bərabərdird.') || content.includes('bərabərdire.')) {
-            console.warn('⚠️ [HTML Export] Cell has merged markers (should have been cleaned):', {
-              row: i,
-              col: j,
-              content: content.substring(0, 200)
-            });
-          }
-          
-          // Skip null/empty values
-          if (content && content.trim() && content.trim().toLowerCase() !== 'null') {
-            // Debug: Log original content before formatting
-            if (content.includes(' r.') || content.includes(' n.') || content.includes(' i.')) {
-              console.log('📝 [HTML Export] Input content has errors:', content.substring(0, 150));
-            }
-            
-            // Convert content into paragraphs (this also applies cleaning)
-            content = formatAsParagraphs(content);
-            
-            // Debug: Check if content still has errors after formatting
-            if (content.includes(' r.') || content.includes(' n.') || content.includes(' i.')) {
-              console.error('❌ [HTML Export] Content STILL has errors after formatAsParagraphs:', {
-                original: (cell.cleaned || '').substring(0, 100),
-                formatted: content.substring(0, 150)
-              });
-            }
-            
-            // If cell has images, append the image HTML from original
-            if (cell.hasImages && cell.original) {
-              // Extract image tags from original and append after translated text
-              const imageMatches = cell.original.match(/<img[^>]*>/g);
-              if (imageMatches) {
-                content = content + imageMatches.join('');
-              }
-            }
-            
-            cellContent = content;
-          } else if (cell.hasImages && cell.original) {
-            // If content is null but has images, just show images
-            const imageMatches = cell.original.match(/<img[^>]*>/g);
-            if (imageMatches) {
-              cellContent = imageMatches.join('');
-            }
-          }
-          
-          // Add classes based on cell properties
+          // Same content shape as CSV / Excel: cleaned text + real <img> tags
+          const { html: cellContent } = buildExportCellContent(cell, (raw) =>
+            formatAsParagraphs(raw)
+          );
+
           if (cell.hasHtml) cellClass += ' has-html';
-          if (cell.hasImages) cellClass += ' has-images';
+          if (cell.hasImages || collectExportImageTags(cell).length > 0) {
+            cellClass += ' has-images';
+          }
           if (isCodeColumn(j)) cellClass += ' code-cell';
-          if (j === 2) cellClass += ' question-cell'; // Question column
+          if (j === 2) cellClass += ' question-cell';
+
+          if (
+            cellContent &&
+            (cellContent.includes(' r.') ||
+              cellContent.includes(' n.') ||
+              cellContent.includes(' i.'))
+          ) {
+            console.warn(
+              '⚠️ [HTML Export] Writing cellContent with errors to HTML:',
+              cellContent.substring(0, 150)
+            );
+          }
+
+          htmlContent += `                    <td class="${cellClass}">${cellContent}</td>\n`;
+        } else {
+          htmlContent += `                    <td class="${cellClass}"></td>\n`;
         }
-        
-        // Final debug check - log if we're writing content with errors
-        if (cellContent && (cellContent.includes(' r.') || cellContent.includes(' n.') || cellContent.includes(' i.'))) {
-          console.warn('⚠️ [HTML Export] Writing cellContent with errors to HTML:', cellContent.substring(0, 150));
-        }
-        
-        htmlContent += `                    <td class="${cellClass}">${cellContent}</td>\n`;
       }
       
       htmlContent += '                </tr>\n';
@@ -2250,7 +2250,7 @@ export function DataTable({
               variant="outline"
               size="sm"
               onClick={handleExportCSV}
-              title="Export full text + images as CSV (may be large; no Excel 32,767 limit)"
+              title="Export translated text + real &lt;img&gt; tags (same as HTML export; file may be large)"
               className="bg-sky-50 border-sky-300 text-sky-700 hover:bg-sky-100"
             >
               <FileSpreadsheet className="h-4 w-4 mr-1" />
@@ -2260,7 +2260,7 @@ export function DataTable({
               variant="outline"
               size="sm"
               onClick={handleExportExcelWithHTML}
-              title="Export with HTML to Excel (.xlsx). Cells over 32,767 chars are truncated."
+              title="Export like HTML when images fit. Oversized images are omitted (use CSV/HTML) — never replaced with [IMAGE]."
               className="bg-purple-50 border-purple-300 text-purple-700 hover:bg-purple-100"
             >
               <FileText className="h-4 w-4 mr-1" />

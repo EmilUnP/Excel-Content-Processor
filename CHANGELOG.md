@@ -20,6 +20,9 @@ cell (often with base64 images) exceeded Excel's hard limit.
   stripping them to `[IMAGE]`. File may be large; Excel export still shrinks images.
 - Export downloads use the file’s **nice name** from the app
   (e.g. `Olimpiada_new_phase_HIS.xlsx (az).csv`) instead of `data-export-…`.
+- Excel/CSV no longer write fake `[IMAGE]` stubs. Cells get real `<img src="data:image/…">`
+  tags like HTML export / import. If Excel’s 32k limit blocks an image, it notes
+  to use CSV or HTML instead.
 
 ---
 

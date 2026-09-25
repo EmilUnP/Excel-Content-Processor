@@ -205,8 +205,10 @@ export default function HomePage() {
           </div>
         </header>
 
-        {/* Progress Bar */}
-        {isProcessing && (
+        {/* Top progress toast — only when the translation dialog is closed.
+            While Translate is open, that dialog is the single progress UI
+            (avoids two identical bars on one page). */}
+        {isProcessing && !ui.showTranslation && (
           <ProgressBar
             current={processingProgress.current}
             total={processingProgress.total}
