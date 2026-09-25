@@ -18,28 +18,18 @@ import { getImageTextModel } from '@/lib/model-config';
  *
  * POST /api/files/image-text   body: { fileId, model? }
  *
- * Step 2 of the image pipeline. Step 1 (`/api/files/images`) narrowed the file
- * to questions that have pictures at all, using flags computed at upload time.
- * This step looks *inside* each picture with a vision model and asks whether it
- * contains words, so a later version can translate them.
- *
- * A diagram labelled "1 2 3 4" survives step 1 but not this one - there is
- * nothing in it to translate.
- *
- * The response is a stream of newline-delimited JSON events rather than one
- * object at the end. Reading a few hundred images takes minutes, and without
- * progress the UI cannot tell "working" from "hung":
- *
- *   {"type":"start","total":128,"cached":40}
- *   {"type":"progress","done":41,"total":128}
- *   {"type":"done","data":{...},"stats":{...}}
- *   {"type":"error","error":"..."}
- *
- * Every classification is cached by image content, so re-running costs nothing.
- * The source file is left untouched; the result is saved as `<fileId>_imagetext`.
+ * Streams NDJSON progress. On success the filtered file is saved to disk and
+ * the final event carries only `{ fileId, stats }` — never the full file body.
+ * Shipping megabytes of base64 images in one stream line was freezing the
+ * browser on runs with thousands of images.
  */
 
+export const maxDuration = 3600;
+export const dynamic = 'force-dynamic';
+
 const SRC_RE = /src\s*=\s*"(data:image\/[^"]+)"/i;
+/** Flush cache to disk this often so a crash mid-run does not lose paid work. */
+const CACHE_SAVE_EVERY = 40;
 
 /** Pulls the data URLs out of a cell's stored HTML. */
 function imageUrlsOf(cell: CellData): string[] {
@@ -48,7 +38,6 @@ function imageUrlsOf(cell: CellData): string[] {
     const match = tag.match(SRC_RE);
     if (match) urls.push(match[1]);
   }
-  // Some cells keep the payload separately rather than inline.
   if (urls.length === 0 && cell.imageData && cell.imageData.startsWith('data:image')) {
     urls.push(cell.imageData);
   }
@@ -57,14 +46,13 @@ function imageUrlsOf(cell: CellData): string[] {
 
 type Emit = (event: Record<string, unknown>) => void;
 
-/** Does the work, reporting progress through `send`. */
 async function runFilter(
   fileId: string,
   model: string,
-  /** Keep only images whose words are in this language; 'any' skips the check. */
   language: ImageTextLanguage | 'any',
   apiKey: string,
-  send: Emit
+  send: Emit,
+  signal?: AbortSignal
 ) {
   const needLanguage = language !== 'any';
   const file = await FileStorage.getFile(fileId);
@@ -73,7 +61,6 @@ async function runFilter(
     return;
   }
 
-  // Rebuild the row grid, exactly as the table and step 1 do.
   let maxRow = 0;
   let maxCol = 0;
   for (const cell of file.cells) {
@@ -90,10 +77,8 @@ async function runFilter(
     return;
   }
 
-  // Collect every distinct image once. The same picture often appears in
-  // several variants of the same question.
   const urlsByQuestion = new Map<number, string[]>();
-  const uniqueUrls = new Map<string, string>(); // key -> dataUrl
+  const uniqueUrls = new Map<string, string>();
 
   for (const question of report.questions) {
     const urls: string[] = [];
@@ -107,7 +92,6 @@ async function runFilter(
     urlsByQuestion.set(question.rowIndex, urls);
   }
 
-  // Classify, using the cache wherever possible.
   const cache = await loadCache();
   const verdicts = new Map<string, ImageTextResult>();
   const pending: Array<[string, string]> = [];
@@ -126,13 +110,13 @@ async function runFilter(
   let failed = 0;
   let next = 0;
   let done = fromCache;
+  let sinceCacheSave = 0;
 
-  // Report at most ~1 event per image, but never faster than every 150ms, so a
-  // large file does not flood the stream.
+  // Cap UI updates so a 5k-image run does not flood React.
   let lastSent = 0;
   const reportProgress = (force = false) => {
     const now = Date.now();
-    if (force || now - lastSent > 150) {
+    if (force || now - lastSent > 250) {
       lastSent = now;
       send({ type: 'progress', done, total: uniqueUrls.size });
     }
@@ -141,34 +125,49 @@ async function runFilter(
 
   const worker = async () => {
     while (true) {
+      if (signal?.aborted) return;
       const index = next++;
       if (index >= pending.length) return;
       const [key, url] = pending[index];
       try {
         const result = await classifyImageText(url, client, model);
+        if (signal?.aborted) return;
         verdicts.set(key, result);
         writeEntry(cache, key, model, result);
         analyzed++;
+        sinceCacheSave++;
       } catch (error) {
-        // An image we cannot read is treated as having no text: it is better
-        // to drop a doubtful question than to claim it is translatable.
         console.error('Image classification failed:', error);
+        // Unreadable → treat as no text (safer than claiming it is translatable).
         verdicts.set(key, { kind: 'none', language: 'none', sample: '' });
         failed++;
+        sinceCacheSave++;
       }
       done++;
       reportProgress();
+
+      // Persist cache in chunks so a mid-run crash still keeps paid verdicts.
+      if (sinceCacheSave >= CACHE_SAVE_EVERY) {
+        sinceCacheSave = 0;
+        await saveCache(cache);
+      }
     }
   };
 
-  const workerCount = Math.min(getImageAnalysisConcurrency(), pending.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  const workerCount = Math.min(getImageAnalysisConcurrency(), Math.max(pending.length, 1));
+  if (pending.length > 0) {
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  }
+
+  if (signal?.aborted) {
+    await saveCache(cache);
+    send({ type: 'error', error: 'Analysis was cancelled.' });
+    return;
+  }
+
   reportProgress(true);
   await saveCache(cache);
 
-  // A question survives when at least one of its images carries words - and,
-  // when a language was requested, words in that language. Text in a language
-  // you are not translating into is no more useful than no text at all.
   const qualifies = (url: string) => {
     const verdict = verdicts.get(imageKey(url, model));
     if (!verdict || verdict.kind !== 'words') return false;
@@ -207,7 +206,6 @@ async function runFilter(
     return;
   }
 
-  // Re-number the kept rows so the table does not build a mostly empty grid.
   const cells: CellData[] = [];
   kept.forEach((question, newRowIndex) => {
     for (const cell of rows[question.rowIndex]) {
@@ -226,6 +224,12 @@ async function runFilter(
     cells
   };
 
+  send({
+    type: 'finalizing',
+    message: 'Saving filtered file…',
+    done: uniqueUrls.size,
+    total: uniqueUrls.size
+  });
   await FileStorage.saveFile(filteredId, filtered);
 
   const stats = {
@@ -247,17 +251,15 @@ async function runFilter(
   };
 
   console.log('Image-text filter:', JSON.stringify(stats));
-  send({ type: 'done', data: filtered, stats });
+  // fileId only — client loads the file over GET. Never stream the full body.
+  send({ type: 'done', fileId: filteredId, stats });
 }
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
   const { fileId, language = 'any' } = body;
-  // Falls back to the env-configured reader when the client does not name one.
   const model: string = body.model || getImageTextModel();
 
-  // Problems we can detect before any work starts stay ordinary JSON errors,
-  // so a plain client (or curl) still sees a status code.
   if (!fileId) {
     return NextResponse.json({ success: false, error: 'File ID is required' }, { status: 400 });
   }
@@ -267,7 +269,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(
       {
         success: false,
-        error: 'OPENROUTER_API_KEY is not set. Add it to your .env file - get a key at https://openrouter.ai/keys'
+        error:
+          'OPENROUTER_API_KEY is not set. Add it to your .env file - get a key at https://openrouter.ai/keys'
       },
       { status: 500 }
     );
@@ -276,20 +279,47 @@ export async function POST(request: NextRequest) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
+      let closed = false;
       const send: Emit = (event) => {
-        controller.enqueue(encoder.encode(JSON.stringify(event) + '\n'));
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(JSON.stringify(event) + '\n'));
+        } catch (error) {
+          // Client went away (refresh / navigation). Stop writing; workers
+          // still honour request.signal below.
+          closed = true;
+          const code =
+            error && typeof error === 'object' && 'code' in error
+              ? String((error as { code?: string }).code)
+              : '';
+          if (code !== 'ERR_INVALID_STATE') {
+            console.warn('Image-text stream write failed:', error);
+          }
+        }
       };
+
       try {
-        await runFilter(fileId, model, language, apiKey, send);
+        await runFilter(fileId, model, language, apiKey, send, request.signal);
       } catch (error) {
         console.error('Image-text filter error:', error);
         send({
           type: 'error',
-          error: error instanceof Error ? error.message : 'Failed to analyse the images'
+          error:
+            error instanceof Error ? error.message : 'Failed to analyse the images'
         });
       } finally {
-        controller.close();
+        if (!closed) {
+          closed = true;
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
+        }
       }
+    },
+    cancel() {
+      // Browser aborted the fetch — ReadableStream cancel fires here.
     }
   });
 
@@ -297,7 +327,6 @@ export async function POST(request: NextRequest) {
     headers: {
       'Content-Type': 'application/x-ndjson; charset=utf-8',
       'Cache-Control': 'no-store, no-transform',
-      // Stops intermediate proxies buffering the stream into one lump.
       'X-Accel-Buffering': 'no'
     }
   });

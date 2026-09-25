@@ -72,8 +72,11 @@ other language. Judge by the words themselves, not by the alphabet alone -
 Azerbaijani and Turkish both use Latin letters, Russian uses Cyrillic.
 When the kind is "numeric" or "none", the language is "none".
 
-Return ONLY a JSON object, no commentary:
-{"kind":"words"|"numeric"|"none","language":"ru"|"az"|"en"|"tr"|"other"|"none","sample":"<up to 60 characters of the text you saw, or an empty string>"}`;
+Return ONLY a JSON object, no commentary. Keep "sample" empty or very short
+(ASCII only, no quotes) so the JSON never breaks:
+{"kind":"words"|"numeric"|"none","language":"ru"|"az"|"en"|"tr"|"other"|"none","sample":""}`;
+
+const KNOWN_LANGUAGES: ImageTextLanguage[] = ['ru', 'az', 'en', 'tr', 'other', 'none'];
 
 /** How many images may be classified at once. Vision calls are network-bound. */
 export function getImageAnalysisConcurrency(): number {
@@ -90,40 +93,70 @@ export function createVisionClient(apiKey: string): OpenAI {
   });
 }
 
-function parseResult(raw: string): ImageTextResult {
-  let text = raw.trim();
-  if (!text.startsWith('{')) {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (match) text = match[0];
-  }
-
-  const parsed = JSON.parse(text) as { kind?: string; language?: string; sample?: string };
+function normalizeResult(
+  kindRaw: string | undefined,
+  languageRaw: string | undefined,
+  sampleRaw: unknown
+): ImageTextResult {
   const kind: ImageTextKind =
-    parsed.kind === 'words' || parsed.kind === 'numeric' || parsed.kind === 'none'
-      ? parsed.kind
+    kindRaw === 'words' || kindRaw === 'numeric' || kindRaw === 'none'
+      ? kindRaw
       : 'none';
 
-  const known: ImageTextLanguage[] = ['ru', 'az', 'en', 'tr', 'other', 'none'];
   let language: ImageTextLanguage =
-    known.includes(parsed.language as ImageTextLanguage)
-      ? (parsed.language as ImageTextLanguage)
+    KNOWN_LANGUAGES.includes(languageRaw as ImageTextLanguage)
+      ? (languageRaw as ImageTextLanguage)
       : 'other';
-  // Only "words" can carry a language; anything else has nothing to translate.
   if (kind !== 'words') language = 'none';
 
   return {
     kind,
     language,
-    sample: typeof parsed.sample === 'string' ? parsed.sample.slice(0, 60) : ''
+    sample: typeof sampleRaw === 'string' ? sampleRaw.slice(0, 60) : ''
   };
 }
 
 /**
- * Classifies a single image given as a `data:image/...;base64,...` URL.
- *
- * Throws on API failure; the caller decides what an unclassifiable image means.
+ * Parses the model reply. Large runs used to treat every broken JSON sample
+ * (unescaped quotes, truncated strings) as "no text", which silently deleted
+ * good questions. We try JSON first, then fall back to field regexes.
  */
-export async function classifyImageText(
+export function parseResult(raw: string): ImageTextResult {
+  let text = raw.trim();
+  if (text.startsWith('```')) {
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  }
+  if (!text.startsWith('{')) {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (match) text = match[0];
+  }
+
+  try {
+    const parsed = JSON.parse(text) as {
+      kind?: string;
+      language?: string;
+      sample?: string;
+    };
+    return normalizeResult(parsed.kind, parsed.language, parsed.sample);
+  } catch {
+    // Sample fields often contain unescaped quotes and break JSON.parse.
+    // Pull the two fields that actually drive filtering.
+    const kindMatch = text.match(/"kind"\s*:\s*"(words|numeric|none)"/i);
+    const languageMatch = text.match(
+      /"language"\s*:\s*"(ru|az|en|tr|other|none)"/i
+    );
+    if (kindMatch) {
+      return normalizeResult(
+        kindMatch[1].toLowerCase(),
+        languageMatch?.[1]?.toLowerCase(),
+        ''
+      );
+    }
+    throw new Error(`Could not parse vision response: ${text.slice(0, 120)}`);
+  }
+}
+
+async function classifyOnce(
   dataUrl: string,
   client: OpenAI,
   model: string
@@ -140,12 +173,36 @@ export async function classifyImageText(
       }
     ],
     response_format: { type: 'json_object' },
-    max_tokens: 200,
-    // The task is a classification, not a creative one - keep it repeatable.
+    // Short reply only — long "sample" strings were truncating and breaking JSON.
+    max_tokens: 80,
     temperature: 0
   });
 
   const raw = response.choices[0]?.message?.content?.trim() || '';
   if (!raw) throw new Error('Empty response from the vision model');
   return parseResult(raw);
+}
+
+/**
+ * Classifies a single image given as a `data:image/...;base64,...` URL.
+ *
+ * Throws on API failure; the caller decides what an unclassifiable image means.
+ * One automatic retry covers flaky truncations on long runs.
+ */
+export async function classifyImageText(
+  dataUrl: string,
+  client: OpenAI,
+  model: string
+): Promise<ImageTextResult> {
+  try {
+    return await classifyOnce(dataUrl, client, model);
+  } catch (firstError) {
+    // One retry: intermittent truncation / rate limits show up a lot past ~2k images.
+    try {
+      await new Promise((r) => setTimeout(r, 400));
+      return await classifyOnce(dataUrl, client, model);
+    } catch {
+      throw firstError;
+    }
+  }
 }

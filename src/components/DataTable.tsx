@@ -2042,14 +2042,16 @@ export function DataTable({
       let buffer = '';
       let finished = false;
 
-      const handle = (event: Record<string, unknown>) => {
+      const handle = async (event: Record<string, unknown>) => {
         if (event.type === 'start') {
           const total = Number(event.total) || 0;
           const cached = Number(event.cached) || 0;
           setActionProgress({
             done: cached,
             total,
-            label: `Reading ${total.toLocaleString()} image(s) with ${selectedModel}`
+            label: cached
+              ? `${cached.toLocaleString()} already cached · ${total.toLocaleString()} total`
+              : `Reading ${total.toLocaleString()} image(s) with ${selectedModel}`
           });
         } else if (event.type === 'progress') {
           const done = Number(event.done) || 0;
@@ -2057,11 +2059,41 @@ export function DataTable({
           setActionProgress({
             done,
             total,
-            label: `Reading image ${Math.min(done + 1, total).toLocaleString()} of ${total.toLocaleString()}`
+            label: `Classified ${done.toLocaleString()} of ${total.toLocaleString()} images`
+          });
+        } else if (event.type === 'finalizing') {
+          setActionProgress({
+            done: Number(event.done) || 0,
+            total: Number(event.total) || 0,
+            label: String(event.message || 'Saving filtered file…')
           });
         } else if (event.type === 'done') {
           finished = true;
           const s = event.stats as Record<string, number>;
+          const resultId = String(event.fileId || '');
+
+          // Load the saved file by id — the stream no longer carries the full
+          // body (that froze the tab on 2k+ image runs).
+          let filtered: FileData | null = null;
+          if (resultId) {
+            setActionProgress({
+              done: s.uniqueImages || 0,
+              total: s.uniqueImages || 0,
+              label: 'Loading filtered file…'
+            });
+            const fileRes = await fetch(`/api/files/${encodeURIComponent(resultId)}`);
+            const fileJson = await fileRes.json().catch(() => null);
+            if (!fileRes.ok || !fileJson?.data) {
+              throw new Error(fileJson?.error || 'Could not load the filtered file');
+            }
+            filtered = fileJson.data as FileData;
+          } else if (event.data) {
+            // Older servers still streamed the full body.
+            filtered = event.data as FileData;
+          }
+
+          if (!filtered) throw new Error('Analysis finished without a file id.');
+
           setActionState('done');
           setActionProgress(undefined);
           setActionMessage(
@@ -2090,7 +2122,7 @@ export function DataTable({
               </p>
             </>
           );
-          onFileReplaced?.(event.data as FileData);
+          onFileReplaced?.(filtered);
         } else if (event.type === 'error') {
           finished = true;
           failAction(new Error(String(event.error)));
@@ -2105,10 +2137,10 @@ export function DataTable({
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
         for (const line of lines) {
-          if (line.trim()) handle(JSON.parse(line));
+          if (line.trim()) await handle(JSON.parse(line));
         }
       }
-      if (buffer.trim()) handle(JSON.parse(buffer));
+      if (buffer.trim()) await handle(JSON.parse(buffer));
 
       if (!finished) throw new Error('The analysis ended without a result.');
     } catch (error) {
@@ -2570,7 +2602,8 @@ export function DataTable({
         {actionState === 'running' && action === 'imageText' && (
           <p className="text-gray-600">
             Reading the images. Cached ones are free and resolve instantly; the rest are sent to{' '}
-            {selectedModel}.
+            {selectedModel}. Large files (thousands of images) can take tens of minutes — leave
+            this tab open until the dialog finishes.
           </p>
         )}
 
